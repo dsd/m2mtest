@@ -30,6 +30,7 @@
 
 int in_fd;
 off_t in_size;
+off_t in_offs = 0;
 unsigned char *in_map;
 
 int m2m_fd;
@@ -81,10 +82,9 @@ int m2m_open(const char *name)
 }
 
 /* "Output" feeds H264 into the m2m device */
-int setup_output(void)
+int output_set_format(void)
 {
 	struct v4l2_format fmt = { 0, };
-	struct v4l2_requestbuffers reqbuf = { 0, };
 
 	fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 	fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_H264;
@@ -98,6 +98,12 @@ int setup_output(void)
 
 	out_buf_size = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
 	printf("Output decoding buffer size: %u\n", out_buf_size);
+	return 0;
+}
+
+int output_request_buffers(void)
+{
+	struct v4l2_requestbuffers reqbuf = { 0, };
 
 	reqbuf.count = 2;
 	reqbuf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
@@ -110,7 +116,6 @@ int setup_output(void)
 	out_buf_cnt = reqbuf.count;
 
 	printf("%d output buffers\n", reqbuf.count);
-
 	return 0;
 }
 
@@ -145,6 +150,19 @@ void map_output(void)
 int setup_capture(void)
 {
 	struct v4l2_requestbuffers reqbuf = { 0, };
+	struct v4l2_format fmt;
+
+	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	if (ioctl(m2m_fd, VIDIOC_G_FMT, &fmt) != 0) {
+		err("Failed to read format (after parsing header)");
+		return -1;
+	}
+	printf("Got format: %dx%d (plane sizes: %d, %d)\n",
+		   fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height,
+		   fmt.fmt.pix_mp.plane_fmt[0].sizeimage,
+		   fmt.fmt.pix_mp.plane_fmt[1].sizeimage);
+	return 0; // FIXME remove
+
 	reqbuf.count = 10;
 	reqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	reqbuf.memory = V4L2_MEMORY_MMAP;
@@ -190,25 +208,45 @@ void queue_capture(void)
 	}
 }
 
+int parse_and_queue_header(void)
+{
+	int used, fs, ret;
+
+	printf("Parsing header into output buffer 0...\n");
+	ret = parse_h264_stream(in_map, in_size,
+							out_buf_map[0], out_buf_size, &used, &fs, 1);
+	if (ret == 0) {
+		fprintf(stderr, "Failed to extract header\n");
+		return -1;
+	}
+
+	printf("Extracted header with length %d\n", fs);
+	in_offs += used;
+	ret = queue_buf(0, fs, 0, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, 1);
+	if (ret)
+		fprintf(stderr, "Header queue_buf failed: %d\n", ret);
+
+	return ret;
+}
+
 void parse(void)
 {
-	off_t offset = 0;
 	int used;
 	int fs;
 	int ret;
 	int i = 0;
 
 	for (i = 0; i < out_buf_cnt; i++) {
-		ret = parse_h264_stream(in_map + offset, in_size - offset,
+		ret = parse_h264_stream(in_map + in_offs, in_size - in_offs,
 								out_buf_map[i], out_buf_size, &used, &fs, 0);
-		if (ret == 0 && offset == in_size) {
+		if (ret == 0 && in_offs == in_size) {
 			printf("All frames extracted\n");
 			break;
 		}
 
 		printf("Extracted frame with size %d, queue in outbuf %d\n", fs, i);
 		queue_buf(i, fs, 0, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, 1);
-		offset += used;
+		in_offs += used;
 	}
 }
 
@@ -237,16 +275,52 @@ int main(int argc, char *argv[])
 	if (m2m_open(argv[2]) < 0)
 		return -1;
 
-	if (setup_output() < 0)
+	/* Setup flow based on ELCE2014 slides and Nicolas Dufresne's knowledge:
+	 * S_FMT(OUT)
+	 * S_FMT(CAP) to suggest a fourcc for the raw format; may be changed later
+	 * G_CTRL(MIN_BUF_FOR_OUTPUT)
+	 * REQBUFS(OUT)
+	 * QBUF (the header)
+	 * STREAMON(OUT)
+	 * QBUF/DQBUF frames on OUT
+	 * source change event, DQEVENT
+	 * G_FMT(CAP)
+	 * ENUM_FMT(CAP)
+	 * S_FMT(CAP) to set fourcc chosen from ENUM_FMT; also get resolution from returned values?
+	 * G_SELECTION to get visible size
+	 * G_CTRL(MIN_BUF_FOR_CAPTURE)
+	 * REQBUFS(CAP)
+	 * STREAMON(CAP)
+	 */
+
+
+	if (output_set_format() < 0)
+		return -1;
+
+	// FIXME capture S_FMT
+
+	// FIXME G_CTRL(MIN_BUF_FOR_OUTPUT)
+
+	if (output_request_buffers() < 0)
 		return -1;
 
 	map_output();
 
+	parser_init();
+	if (parse_and_queue_header() < 0)
+		return -1;
+
+	stream(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, VIDIOC_STREAMON);
+
+	// FIXME queue the rest of the output
+
+	// FIXME wait for source change event
+
 	if (setup_capture() < 0)
 		return -1;
 
+	return 0;
 	queue_capture();
-	parser_init();
 	parse();
 	stream(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, VIDIOC_STREAMON);
 	stream(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, VIDIOC_STREAMON);
