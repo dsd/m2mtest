@@ -19,6 +19,7 @@
  * limitations under the License.
  */
 
+#include <unistd.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <linux/videodev2.h>
@@ -214,7 +215,7 @@ int parse_and_queue_header(void)
 
 	printf("Parsing header into output buffer 0...\n");
 	ret = parse_h264_stream(in_map, in_size,
-							out_buf_map[0], out_buf_size, &used, &fs, 1);
+							out_buf_map[0], out_buf_size, &used, &fs, 0);
 	if (ret == 0) {
 		fprintf(stderr, "Failed to extract header\n");
 		return -1;
@@ -315,7 +316,7 @@ int main(int argc, char *argv[])
 	// FIXME queue the rest of the output
 
 	// FIXME wait for source change event
-
+sleep(5);
 	if (setup_capture() < 0)
 		return -1;
 
