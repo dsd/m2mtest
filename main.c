@@ -20,6 +20,7 @@
  */
 
 #include <unistd.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <linux/videodev2.h>
@@ -40,7 +41,7 @@ int out_buf_cnt;
 int out_buf_size;
 
 int cap_buf_cnt;
-int cap_buf_size[2] = { 2088960, 1044480 }; // FIXME detect this
+int cap_buf_size[2];
 
 int input_open(const char *name)
 {
@@ -162,7 +163,9 @@ int setup_capture(void)
 		   fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height,
 		   fmt.fmt.pix_mp.plane_fmt[0].sizeimage,
 		   fmt.fmt.pix_mp.plane_fmt[1].sizeimage);
-	return 0; // FIXME remove
+
+	cap_buf_size[0] = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+	cap_buf_size[1] = fmt.fmt.pix_mp.plane_fmt[1].sizeimage;
 
 	reqbuf.count = 10;
 	reqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -263,6 +266,45 @@ int stream(enum v4l2_buf_type type, int status)
 	return 0;
 }
 
+int subscribe_source_change(void)
+{
+	struct v4l2_event_subscription sub = { 0, };
+	sub.type = V4L2_EVENT_SOURCE_CHANGE;
+
+	if (ioctl(m2m_fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0) {
+		fprintf(stderr, "Failed to subscribe to src change: %m\n");
+		return -1;
+	}
+
+	printf("Subscribed to source change event.\n");
+	return 0;
+}
+
+int wait_for_source_change(void)
+{
+	struct v4l2_event ev = { 0, };
+	int ret;
+	int i;
+
+	for (i = 0; i < 5; i++) {
+		ret = ioctl(m2m_fd, VIDIOC_DQEVENT, &ev);
+		if (ret == 0) {
+			printf("Got event type %d.\n", ev.type);
+			return 0;
+		} else if (ret && errno == ENOENT) {
+			printf("No event yet, try again.\n");
+		} else if (ret) {
+			fprintf(stderr, "DQEVENT error %m\n");
+			return -1;
+		}
+		sleep(1);
+	}
+
+	fprintf(stderr, "Didn't receive source change event.\n");
+	return -1;
+
+}
+
 int main(int argc, char *argv[])
 {
 	if (argc < 3) {
@@ -274,6 +316,9 @@ int main(int argc, char *argv[])
 		return -1;
 	
 	if (m2m_open(argv[2]) < 0)
+		return -1;
+
+	if (subscribe_source_change() < 0)
 		return -1;
 
 	/* Setup flow based on ELCE2014 slides and Nicolas Dufresne's knowledge:
@@ -315,8 +360,9 @@ int main(int argc, char *argv[])
 
 	// FIXME queue the rest of the output
 
-	// FIXME wait for source change event
-sleep(5);
+	if (wait_for_source_change() < 0)
+		return -1;
+
 	if (setup_capture() < 0)
 		return -1;
 
