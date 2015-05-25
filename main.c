@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <linux/videodev2.h>
 #include <sys/mman.h>
@@ -36,12 +37,14 @@ off_t in_offs = 0;
 unsigned char *in_map;
 
 int m2m_fd;
-char *out_buf_map[2];
+unsigned char *out_buf_map[2];
+int out_buf_queued[2];
 int out_buf_cnt;
 int out_buf_size;
 
 int cap_buf_cnt;
 int cap_buf_size[2];
+unsigned char *cap_buf_map[10];
 
 int input_open(const char *name)
 {
@@ -149,6 +152,35 @@ void map_output(void)
 	}
 }
 
+void map_capture(void)
+{
+	int i;
+	for (i = 0; i < cap_buf_cnt; i++) {
+		struct v4l2_buffer buf = { 0, };
+		struct v4l2_plane planes[1];
+
+		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+		buf.memory = V4L2_MEMORY_MMAP;
+		buf.index = i;
+		buf.m.planes = planes;
+		buf.length = 1;
+
+		if (ioctl(m2m_fd, VIDIOC_QUERYBUF, &buf) < 0) {
+			fprintf(stderr, "querybuf output %d: %m\n", i);
+			continue;
+		}
+
+		cap_buf_map[i] = mmap(NULL, buf.m.planes[0].length,
+							  PROT_READ | PROT_WRITE, MAP_SHARED, m2m_fd,
+							  buf.m.planes[0].m.mem_offset);
+		if (cap_buf_map[i] == MAP_FAILED) {
+			fprintf(stderr, "map capture buffer %d: %m\n", i);
+			continue;
+		}
+	}
+}
+
+
 int setup_capture(void)
 {
 	struct v4l2_requestbuffers reqbuf = { 0, };
@@ -207,51 +239,95 @@ void queue_capture(void)
 {
 	int i;
 	for (i = 0; i < cap_buf_cnt; i++) {
-		queue_buf(i, cap_buf_size[0], cap_buf_size[1],
-				  V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, 2);
+		queue_buf(i, cap_buf_size[0], 0,
+				  V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, 1);
 	}
 }
 
-int parse_and_queue_header(void)
+int dequeue_output(int *n)
 {
-	int used, fs, ret;
+	struct v4l2_buffer qbuf = { 0, };
+	struct v4l2_plane planes[2] = { 0, };
 
-	printf("Parsing header into output buffer 0...\n");
-	ret = parse_h264_stream(in_map, in_size,
-							out_buf_map[0], out_buf_size, &used, &fs, 0);
-	if (ret == 0) {
-		fprintf(stderr, "Failed to extract header\n");
+	qbuf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+	qbuf.memory = V4L2_MEMORY_MMAP;
+	qbuf.m.planes = planes;
+	qbuf.length = 1;
+
+	if (ioctl(m2m_fd, VIDIOC_DQBUF, &qbuf)) {
+		fprintf(stderr, "Output dequeue error: %m\n");
 		return -1;
 	}
 
-	printf("Extracted header with length %d\n", fs);
-	in_offs += used;
-	ret = queue_buf(0, fs, 0, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, 1);
-	if (ret)
-		fprintf(stderr, "Header queue_buf failed: %d\n", ret);
-
-	return ret;
+	printf("Dequeued output buffer %d\n", qbuf.index);
+	*n = qbuf.index;
+	return 0;
 }
 
-void parse(void)
+int dequeue_capture(int *n)
 {
+	struct v4l2_buffer qbuf = { 0, };
+	struct v4l2_plane planes[2] = { 0, };
+
+	qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	qbuf.memory = V4L2_MEMORY_MMAP;
+	qbuf.m.planes = planes;
+	qbuf.length = 1;
+
+	if (ioctl(m2m_fd, VIDIOC_DQBUF, &qbuf)) {
+		fprintf(stderr, "Output dequeue error: %m\n");
+		return -1;
+	}
+
+	printf("Dequeued capture buffer %d, bytesused %d\n", qbuf.index, qbuf.m.planes[0].bytesused);
+	*n = qbuf.index;
+	return 0;
+}
+
+int parse_one_nal(void)
+{
+	int n = 0;
+	int ret;
 	int used;
 	int fs;
+
+	while (n < out_buf_cnt && out_buf_queued[n])
+		n++;
+
+	if (n >= out_buf_cnt) {
+		printf("All buffers queued, dequeing one\n");
+		ret = dequeue_output(&n);
+		if (ret)
+			return ret;
+
+		out_buf_queued[n] = 0;
+	}
+
+	ret = parse_h264_stream(in_map + in_offs, in_size - in_offs,
+							out_buf_map[n], out_buf_size, &used, &fs, 0);
+	if (ret == 0 && in_offs == in_size) {
+		printf("All frames extracted\n");
+		return 1;
+	}
+
+	printf("Extracted frame with size %d, queue in outbuf %d\n", fs, n);
+	queue_buf(n, fs, 0, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, 1);
+	out_buf_queued[n] = 1;
+	in_offs += used;
+
+	return 0;
+}
+
+void *parser_thread_func(void *args)
+{
 	int ret;
 	int i = 0;
 
-	for (i = 0; i < out_buf_cnt; i++) {
-		ret = parse_h264_stream(in_map + in_offs, in_size - in_offs,
-								out_buf_map[i], out_buf_size, &used, &fs, 0);
-		if (ret == 0 && in_offs == in_size) {
-			printf("All frames extracted\n");
+	while (1) {
+		if (parse_one_nal())
 			break;
-		}
-
-		printf("Extracted frame with size %d, queue in outbuf %d\n", fs, i);
-		queue_buf(i, fs, 0, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, 1);
-		in_offs += used;
 	}
+	printf("parser thread exit\n");
 }
 
 int stream(enum v4l2_buf_type type, int status)
@@ -286,6 +362,7 @@ int wait_for_source_change(void)
 	int ret;
 	int i;
 
+	printf("Waiting for source change event...\n");
 	for (i = 0; i < 5; i++) {
 		ret = ioctl(m2m_fd, VIDIOC_DQEVENT, &ev);
 		if (ret == 0) {
@@ -305,8 +382,23 @@ int wait_for_source_change(void)
 
 }
 
+void write_capture(void)
+{
+	int n;
+	FILE *fd;
+	if (dequeue_capture(&n))
+		return;
+	
+	fd = fopen("out", "w");
+	fwrite(cap_buf_map[n], 1, cap_buf_size[0], fd);
+	fclose(fd);
+	printf("Written to output file.\n");
+}
+
 int main(int argc, char *argv[])
 {
+	pthread_t parser_thread;
+
 	if (argc < 3) {
 		fprintf(stderr, "Usage: %s <input file> <m2m device>\n", argv[0]);
 		return 1;
@@ -352,13 +444,17 @@ int main(int argc, char *argv[])
 
 	map_output();
 
-	parser_init();
-	if (parse_and_queue_header() < 0)
-		return -1;
+	//if (parse_and_queue_header() < 0)
+	//	return -1;
 
+	parse_one_nal();
 	stream(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, VIDIOC_STREAMON);
 
-	// FIXME queue the rest of the output
+	parser_init();
+	if (pthread_create(&parser_thread, NULL, parser_thread_func, NULL)) {
+		fprintf(stderr, "Failed to launch parser thread\n");
+		return -1;
+	}
 
 	if (wait_for_source_change() < 0)
 		return -1;
@@ -366,11 +462,14 @@ int main(int argc, char *argv[])
 	if (setup_capture() < 0)
 		return -1;
 
-	return 0;
+	map_capture();
 	queue_capture();
-	parse();
+	//parse();
 	stream(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, VIDIOC_STREAMON);
 	stream(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, VIDIOC_STREAMON);
+	sleep(5);
+	write_capture();
 
+	pthread_join(parser_thread, 0);
 	return 0;
 }
