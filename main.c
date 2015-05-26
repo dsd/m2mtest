@@ -23,7 +23,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <limits.h>
 #include <linux/videodev2.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -45,6 +47,8 @@ int out_buf_size;
 int cap_buf_cnt;
 int cap_buf_size[2];
 unsigned char *cap_buf_map[10];
+int cap_width;
+int cap_height;
 
 int input_open(const char *name)
 {
@@ -198,6 +202,8 @@ int setup_capture(void)
 
 	cap_buf_size[0] = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
 	cap_buf_size[1] = fmt.fmt.pix_mp.plane_fmt[1].sizeimage;
+	cap_width = fmt.fmt.pix_mp.width;
+	cap_height = fmt.fmt.pix_mp.height;
 
 	reqbuf.count = 10;
 	reqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -264,7 +270,7 @@ int dequeue_output(int *n)
 	return 0;
 }
 
-int dequeue_capture(int *n)
+int dequeue_capture(int *n, uint32_t *bytesused)
 {
 	struct v4l2_buffer qbuf = { 0, };
 	struct v4l2_plane planes[2] = { 0, };
@@ -275,12 +281,13 @@ int dequeue_capture(int *n)
 	qbuf.length = 1;
 
 	if (ioctl(m2m_fd, VIDIOC_DQBUF, &qbuf)) {
-		fprintf(stderr, "Output dequeue error: %m\n");
+		fprintf(stderr, "Capture dequeue error: %m\n");
 		return -1;
 	}
 
 	printf("Dequeued capture buffer %d, bytesused %d\n", qbuf.index, qbuf.m.planes[0].bytesused);
 	*n = qbuf.index;
+	*bytesused = qbuf.m.planes[0].bytesused;
 	return 0;
 }
 
@@ -382,17 +389,49 @@ int wait_for_source_change(void)
 
 }
 
-void write_capture(void)
+void save_image(int n)
 {
-	int n;
+	char filename[PATH_MAX];
 	FILE *fd;
-	if (dequeue_capture(&n))
+	static int ctr = 0;
+	unsigned char *data = cap_buf_map[n];
+	int offset = 0;
+
+	sprintf(filename, "img%03d.ppm", ++ctr);
+
+	fd = fopen(filename, "w");
+	if (!fd)
 		return;
-	
-	fd = fopen("out", "w");
-	fwrite(cap_buf_map[n], 1, cap_buf_size[0], fd);
+
+	/* write ppm format, no alpha channel */
+	fprintf(fd, "P6 %d %d 255\n", cap_width, cap_height);
+	while (offset < cap_buf_size[0]) {
+		fwrite(data, 1, 3, fd);
+		data += 4;
+		offset += 4;
+	}
+
 	fclose(fd);
-	printf("Written to output file.\n");
+	printf("Written to output file %s.\n", filename);
+}
+
+void capture(void)
+{
+	while (1) {
+		int n;
+		uint32_t bytesused;
+		if (dequeue_capture(&n, &bytesused))
+			return;
+
+		if (bytesused == 0) {
+			printf("Capture finished.\n");
+			break;
+		}
+
+		save_image(n);
+		queue_buf(n, cap_buf_size[0], 0,
+				  V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, 1);
+	}
 }
 
 int main(int argc, char *argv[])
@@ -464,11 +503,8 @@ int main(int argc, char *argv[])
 
 	map_capture();
 	queue_capture();
-	//parse();
 	stream(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, VIDIOC_STREAMON);
-	stream(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, VIDIOC_STREAMON);
-	sleep(5);
-	write_capture();
+	capture();
 
 	pthread_join(parser_thread, 0);
 	return 0;
