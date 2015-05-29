@@ -312,6 +312,7 @@ int parse_one_nal(void)
 
 	ret = parse_h264_stream(in_map + in_offs, in_size - in_offs,
 							out_buf_map[n], out_buf_size, &used, &fs, 0);
+	used = fs; /* don't consume the next RBSP stop sequence */
 	if (ret == 0 && in_offs == in_size) {
 		printf("All frames extracted\n");
 		return 1;
