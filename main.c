@@ -326,6 +326,21 @@ int parse_one_nal(void)
 	return 0;
 }
 
+int stop_decoder(void)
+{
+	struct v4l2_decoder_cmd cmd = { 0, };
+
+	cmd.cmd = V4L2_DEC_CMD_STOP;
+
+	if (ioctl(m2m_fd, VIDIOC_DECODER_CMD, &cmd)) {
+		fprintf(stderr, "Decoder command error: %m\n");
+		return -1;
+	}
+
+	printf("Started decoder drain\n");
+	return 0;
+}
+
 void *parser_thread_func(void *args)
 {
 	int ret;
@@ -335,6 +350,7 @@ void *parser_thread_func(void *args)
 		if (parse_one_nal())
 			break;
 	}
+	stop_decoder();
 	printf("parser thread exit\n");
 }
 
