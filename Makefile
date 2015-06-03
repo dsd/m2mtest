@@ -9,4 +9,4 @@ clean:
 	$(CC) $(CFLAGS) -c $<
 
 m2mtest: main.o h264parser.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -pthread -o $@ $^
