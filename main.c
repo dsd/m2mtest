@@ -47,6 +47,7 @@ int out_buf_size;
 int cap_buf_cnt;
 int cap_buf_size[2];
 unsigned char *cap_buf_map[10];
+uint32_t cap_bytesperline;
 int cap_width;
 int cap_height;
 
@@ -202,6 +203,7 @@ int setup_capture(void)
 
 	cap_buf_size[0] = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
 	cap_buf_size[1] = fmt.fmt.pix_mp.plane_fmt[1].sizeimage;
+	cap_bytesperline = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
 	cap_width = fmt.fmt.pix_mp.width;
 	cap_height = fmt.fmt.pix_mp.height;
 
@@ -412,7 +414,7 @@ void save_image(int n)
 	FILE *fd;
 	static int ctr = 0;
 	unsigned char *data = cap_buf_map[n];
-	int offset = 0;
+	uint32_t row, col;
 
 	sprintf(filename, "img%03d.ppm", ++ctr);
 
@@ -422,10 +424,10 @@ void save_image(int n)
 
 	/* write ppm format, no alpha channel */
 	fprintf(fd, "P6 %d %d 255\n", cap_width, cap_height);
-	while (offset < cap_buf_size[0]) {
-		fwrite(data, 1, 3, fd);
-		data += 4;
-		offset += 4;
+	for (row = 0; row < cap_height; row++) {
+		for (col = 0; col < cap_width; col++)
+			fwrite(data + (col * 4), 1, 3, fd);
+		data += cap_bytesperline;
 	}
 
 	fclose(fd);
