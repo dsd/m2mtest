@@ -157,6 +157,21 @@ void map_output(void)
 	}
 }
 
+int capture_set_format(void)
+{
+	struct v4l2_format fmt = { 0, };
+
+	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_BGR32;
+
+	if (ioctl(m2m_fd, VIDIOC_S_FMT, &fmt) != 0) {
+		perror("output S_FMT");
+		return -1;
+	}
+
+	return 0;
+}
+
 void map_capture(void)
 {
 	int i;
@@ -493,7 +508,8 @@ int main(int argc, char *argv[])
 	if (output_set_format() < 0)
 		return -1;
 
-	// FIXME capture S_FMT
+	if (capture_set_format() < 0)
+		return -1;
 
 	// FIXME G_CTRL(MIN_BUF_FOR_OUTPUT)
 
