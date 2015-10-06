@@ -19,6 +19,7 @@
  * limitations under the License.
  */
 
+#include <string.h>
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -39,8 +40,8 @@ off_t in_offs = 0;
 unsigned char *in_map;
 
 int m2m_fd;
-unsigned char *out_buf_map[2];
-int out_buf_queued[2];
+unsigned char *out_buf_map[5];
+int out_buf_queued[5];
 int out_buf_cnt;
 int out_buf_size;
 
@@ -115,7 +116,7 @@ int output_request_buffers(void)
 {
 	struct v4l2_requestbuffers reqbuf = { 0, };
 
-	reqbuf.count = 2;
+	reqbuf.count = 5;
 	reqbuf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 	reqbuf.memory = V4L2_MEMORY_MMAP;
 
@@ -234,7 +235,7 @@ int setup_capture(void)
 	return 0;
 }
 
-int queue_buf(int index, int l1, int l2, int type, int nplanes)
+int queue_buf(int index, int l1, int l2, int type, int nplanes, int ts)
 {
 	struct v4l2_buffer qbuf = { 0, };
 	struct v4l2_plane planes[2];
@@ -247,6 +248,7 @@ int queue_buf(int index, int l1, int l2, int type, int nplanes)
 	qbuf.length = nplanes;
 	qbuf.m.planes[0].bytesused = l1;
 	qbuf.m.planes[1].bytesused = l2;
+	qbuf.timestamp.tv_sec = ts;
 	ret = ioctl(m2m_fd, VIDIOC_QBUF, &qbuf);
 
 	if (ret) {
@@ -254,7 +256,7 @@ int queue_buf(int index, int l1, int l2, int type, int nplanes)
 		return ret;
 	}
 
-	printf("Queued buffer %d (type %d)\n", index, type);
+	printf("Queued buffer %d (type %d) ts=%d\n", index, type, ts);
 	return 0;
 }
 
@@ -263,7 +265,7 @@ void queue_capture(void)
 	int i;
 	for (i = 0; i < cap_buf_cnt; i++) {
 		queue_buf(i, cap_buf_size[0], 0,
-				  V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, 1);
+				  V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, 1, 0);
 	}
 }
 
@@ -302,10 +304,43 @@ int dequeue_capture(int *n, uint32_t *bytesused)
 		return -1;
 	}
 
-	printf("Dequeued capture buffer %d, bytesused %d\n", qbuf.index, qbuf.m.planes[0].bytesused);
+	printf("Dequeued capture buffer %d, bytesused %d ts=%ld\n", qbuf.index, qbuf.m.planes[0].bytesused, qbuf.timestamp.tv_sec);
 	*n = qbuf.index;
 	*bytesused = qbuf.m.planes[0].bytesused;
 	return 0;
+}
+
+int send_nal(int ts, int len)
+{
+	int n = 0;
+	int ret;
+	int used;
+	int fs;
+
+	while (n < out_buf_cnt && out_buf_queued[n])
+		n++;
+
+	if (n >= out_buf_cnt) {
+		printf("All buffers queued, oops\n");
+		return 1;
+	}
+
+	ret = parse_h264_stream(in_map + in_offs, in_size - in_offs,
+							out_buf_map[n], out_buf_size, &used, &fs, 0);
+	used = fs; /* don't consume the next RBSP stop sequence */
+	if (ret == 0 && in_offs == in_size) {
+		printf("All frames extracted\n");
+		return 1;
+	}
+
+	memcpy(out_buf_map[n], in_map + in_offs, len);
+	printf("Extracted frame with size %d, queue in outbuf %d\n", len, n);
+	queue_buf(n, len, 0, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, 1, ts);
+	out_buf_queued[n] = 1;
+	in_offs += len;
+
+	return 0;
+
 }
 
 int parse_one_nal(void)
@@ -336,7 +371,7 @@ int parse_one_nal(void)
 	}
 
 	printf("Extracted frame with size %d, queue in outbuf %d\n", fs, n);
-	queue_buf(n, fs, 0, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, 1);
+	queue_buf(n, fs, 0, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, 1, 0);
 	out_buf_queued[n] = 1;
 	in_offs += used;
 
@@ -363,7 +398,7 @@ void *parser_thread_func(void *args)
 	int ret;
 	int i = 0;
 
-	while (1) {
+	while (0) {
 		if (parse_one_nal())
 			break;
 	}
@@ -464,7 +499,7 @@ void capture(void)
 
 		save_image(n);
 		queue_buf(n, cap_buf_size[0], 0,
-				  V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, 1);
+				  V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, 1, 0);
 	}
 }
 
@@ -521,7 +556,12 @@ int main(int argc, char *argv[])
 	//if (parse_and_queue_header() < 0)
 	//	return -1;
 
-	parse_one_nal();
+	//parse_one_nal();
+	send_nal(0, 27);
+	send_nal(0, 8);
+	send_nal(0, 41802);
+	send_nal(1, 608);
+	send_nal(2, 67);
 	stream(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, VIDIOC_STREAMON);
 
 	parser_init();
